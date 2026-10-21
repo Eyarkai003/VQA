@@ -1,220 +1,313 @@
+
+import io
+import json
+import html
+
 import streamlit as st
 import torch
+import speech_recognition as sr
+
 from PIL import Image
 from transformers import ViltProcessor, ViltForQuestionAnswering
+import streamlit.components.v1 as components
 
-# ---------------- PAGE CONFIGURATION ----------------
+
+# ---------------- PAGE SETTINGS ----------------
+
 st.set_page_config(
-    page_title="Trustworthy Visual Question Answering",
-    page_icon="🔎",
-    layout="wide"
+    page_title="Trustworthy VQA Assistant",
+    page_icon="👁️",
+    layout="centered"
 )
 
-st.title("🔎 Trustworthy Visual Question Answering")
-st.caption(
-    "Evidence-aware image question answering with uncertainty warnings "
-    "for assistive technology."
-)
+torch.set_num_threads(2)
 
-st.info(
-    "Research prototype: AI answers may be incorrect. "
-    "Please verify important information."
-)
-
-# ---------------- LOAD MODEL ----------------
 MODEL_NAME = "dandelin/vilt-b32-finetuned-vqa"
 
-@st.cache_resource
-def load_model():
+st.markdown("""
+<style>
+    .block-container {
+        max-width: 900px;
+        padding-top: 2rem;
+        padding-bottom: 3rem;
+    }
+    .main-title {
+        font-size: 2rem;
+        font-weight: 750;
+        text-align: center;
+    }
+    .subtitle {
+        text-align: center;
+        color: #777777;
+        margin-bottom: 25px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ---------------- MODEL LOADING ----------------
+
+@st.cache_resource(show_spinner=False)
+def load_vqa_model():
     processor = ViltProcessor.from_pretrained(MODEL_NAME)
     model = ViltForQuestionAnswering.from_pretrained(MODEL_NAME)
     model.eval()
     return processor, model
 
-# ---------------- SESSION HISTORY ----------------
-if "history" not in st.session_state:
-    st.session_state.history = []
 
-# ---------------- SIDEBAR ----------------
-with st.sidebar:
-    st.header("Project Modules")
-    st.markdown("""
-    1. Image Input
-    2. Question Processing
-    3. Visual Question Answering
-    4. Evidence Inspection
-    5. Uncertainty Estimation
-    6. Answer History
-    """)
-    st.warning(
-        "The displayed model score is a confidence-like score, "
-        "not a calibrated probability that the answer is correct."
+# ---------------- VOICE OUTPUT ----------------
+
+def speak_answer(text):
+    safe_text = json.dumps(text)
+    components.html(
+        f"""
+        <button onclick='
+            window.speechSynthesis.cancel();
+            var msg = new SpeechSynthesisUtterance({safe_text});
+            msg.lang = "en-IN";
+            window.speechSynthesis.speak(msg);
+        ' style="
+            padding:12px 20px;
+            border-radius:10px;
+            border:0;
+            background:#1769aa;
+            color:white;
+            font-size:16px;
+            cursor:pointer;">
+            🔊 Speak Answer
+        </button>
+        """,
+        height=65
     )
 
-# ---------------- IMAGE INPUT ----------------
-uploaded_file = st.file_uploader(
-    "Upload an image",
-    type=["jpg", "jpeg", "png"]
+
+# ---------------- VOICE QUESTION INPUT ----------------
+
+def transcribe_audio(audio_file):
+    recognizer = sr.Recognizer()
+
+    with sr.AudioFile(io.BytesIO(audio_file.getvalue())) as source:
+        audio_data = recognizer.record(source)
+
+    return recognizer.recognize_google(
+        audio_data,
+        language="en-IN"
+    )
+
+
+# ---------------- AI ANSWERING ----------------
+
+def answer_question(image, question, processor, model):
+    inputs = processor(
+        images=image,
+        text=question,
+        return_tensors="pt"
+    )
+
+    with torch.inference_mode():
+        outputs = model(**inputs)
+        probabilities = torch.softmax(
+            outputs.logits[0], dim=-1
+        )
+
+    count = min(3, probabilities.numel())
+    scores, indices = torch.topk(probabilities, k=count)
+
+    results = []
+
+    for score, index in zip(scores.tolist(), indices.tolist()):
+        label = model.config.id2label.get(
+            index, str(index)
+        )
+        results.append({
+            "answer": str(label),
+            "score": float(score)
+        })
+
+    return results
+
+
+# ---------------- MAIN INTERFACE ----------------
+
+st.markdown(
+    '<div class="main-title">👁️ Trustworthy VQA Assistant</div>',
+    unsafe_allow_html=True
 )
 
-if uploaded_file is not None:
-    image = Image.open(uploaded_file).convert("RGB")
+st.markdown(
+    '<div class="subtitle">'
+    'Ask questions about an image using text or voice.'
+    '</div>',
+    unsafe_allow_html=True
+)
 
-    left, right = st.columns([1, 1])
+st.info(
+    "Assistive technology demo: AI answers may be incorrect. "
+    "Do not rely on this prototype alone for navigation, "
+    "emergency decisions, or other safety-critical tasks."
+)
 
-    with left:
-        st.subheader("Input Image")
-        st.image(image, use_container_width=True)
+st.subheader("1. Capture or upload an image")
 
-    with right:
-        st.subheader("Ask a Question")
-        question = st.text_input(
-            "Question about the image",
-            placeholder="Example: What objects are visible?"
-        )
+input_method = st.radio(
+    "Choose image input",
+    ["Use Camera", "Upload Image"],
+    horizontal=True
+)
 
-        uncertainty_threshold = st.slider(
-            "Low-score warning threshold",
-            min_value=0.05,
-            max_value=0.80,
-            value=0.20,
-            step=0.05
-        )
+image_file = None
 
-        ask_button = st.button(
-            "Answer Question",
-            type="primary"
-        )
-
-    if ask_button:
-        if not question.strip():
-            st.warning("Please enter a question.")
-        else:
-            try:
-                with st.spinner("Analyzing the image and question..."):
-                    processor, model = load_model()
-
-                    inputs = processor(
-                        images=image,
-                        text=question.strip(),
-                        return_tensors="pt"
-                    )
-
-                    with torch.inference_mode():
-                        outputs = model(**inputs)
-
-                    probabilities = torch.softmax(
-                        outputs.logits[0], dim=-1
-                    )
-
-                    top_count = min(5, probabilities.numel())
-                    scores, indices = torch.topk(
-                        probabilities, k=top_count
-                    )
-
-                    answers = []
-                    for score, index in zip(scores, indices):
-                        answer = model.config.id2label[index.item()]
-                        answers.append({
-                            "answer": answer,
-                            "score": float(score.item())
-                        })
-
-                    best_answer = answers[0]["answer"]
-                    best_score = answers[0]["score"]
-
-                st.subheader("Answer")
-                st.success(best_answer)
-
-                st.metric(
-                    "Model score",
-                    f"{best_score:.1%}"
-                )
-
-                # This threshold is a heuristic, not a validated
-                # probability of correctness.
-                if best_score < uncertainty_threshold:
-                    st.warning(
-                        "Uncertainty warning: the model's top-answer "
-                        "score is low. Do not rely on this answer "
-                        "without checking the image."
-                    )
-                else:
-                    st.info(
-                        "The top-answer score passed the selected "
-                        "threshold, but the answer may still be wrong."
-                    )
-
-                # ---------------- EVIDENCE INSPECTION ----------------
-                st.subheader("Evidence Inspection")
-                st.image(
-                    image,
-                    caption="Original image used by the model",
-                    use_container_width=True
-                )
-
-                st.write(
-                    "*Question:*",
-                    question.strip()
-                )
-                st.write(
-                    "*Predicted answer:*",
-                    best_answer
-                )
-
-                st.caption(
-                    "This version displays the source image as context. "
-                    "It does not yet generate object-level grounding "
-                    "or prove which image region supports the answer."
-                )
-
-                # ---------------- TOP CANDIDATES ----------------
-                st.subheader("Alternative Answers")
-
-                for rank, item in enumerate(answers, start=1):
-                    st.write(
-                        f"{rank}. *{item['answer']}* — "
-                        f"model score: {item['score']:.1%}"
-                    )
-
-                # ---------------- SAVE HISTORY ----------------
-                st.session_state.history.insert(0, {
-                    "question": question.strip(),
-                    "answer": best_answer,
-                    "score": best_score
-                })
-
-            except Exception as error:
-                st.error(
-                    "The model could not process this request. "
-                    "Check your internet connection and installed "
-                    "dependencies, then try again."
-                )
-                st.exception(error)
-
+if input_method == "Use Camera":
+    image_file = st.camera_input(
+        "Take a picture",
+        key="camera"
+    )
 else:
-    st.markdown("### How to use")
-    st.write("1. Upload a JPG or PNG image.")
-    st.write("2. Type a question about the image.")
-    st.write("3. Select *Answer Question*.")
-    st.write("4. Review the answer, alternative answers, and warning.")
+    image_file = st.file_uploader(
+        "Choose an image",
+        type=["jpg", "jpeg", "png", "webp"]
+    )
 
-# ---------------- HISTORY ----------------
-st.divider()
-st.subheader("Question History")
+image = None
 
-if st.session_state.history:
-    for index, item in enumerate(st.session_state.history, start=1):
-        with st.expander(
-            f"{index}. {item['question']}"
-        ):
-            st.write("*Answer:*", item["answer"])
-            st.write(
-                f"*Model score:* {item['score']:.1%}"
+if image_file is not None:
+    try:
+        image = Image.open(image_file).convert("RGB")
+        st.image(
+            image,
+            caption="Image for AI analysis",
+            use_container_width=True
+        )
+    except Exception:
+        st.error("The image could not be opened. Try another image.")
+        image = None
+
+
+st.subheader("2. Ask a question")
+
+question_text = st.text_input(
+    "Type your question",
+    placeholder="Example: What is in front of me?",
+    key="typed_question"
+)
+
+st.caption("Or record your question in English.")
+
+audio_file = st.audio_input(
+    "🎙️ Record a question",
+    sample_rate=16000
+)
+
+if audio_file is not None:
+    if st.button("Convert voice to text"):
+        with st.spinner("Recognizing your speech..."):
+            try:
+                recognized_text = transcribe_audio(audio_file)
+                st.session_state["voice_question"] = recognized_text
+                st.success("Recognized question:")
+                st.write(recognized_text)
+            except sr.UnknownValueError:
+                st.error("Speech was unclear. Please record again.")
+            except sr.RequestError:
+                st.error(
+                    "Speech recognition service is unavailable. "
+                    "Check your internet connection and try again."
+                )
+            except Exception as error:
+                st.error(f"Audio processing failed: {error}")
+
+
+voice_question = st.session_state.get("voice_question", "")
+question = question_text.strip() or voice_question.strip()
+
+st.caption(
+    "Typed question takes priority. Otherwise, the converted "
+    "voice question is used."
+)
+
+
+st.subheader("3. Get the AI answer")
+
+if st.button("🔍 Analyze Image and Answer", type="primary",
+             use_container_width=True):
+
+    if image is None:
+        st.warning("Please capture or upload an image first.")
+
+    elif not question:
+        st.warning("Please type a question or convert a voice question.")
+
+    else:
+        try:
+            with st.spinner(
+                "Loading the AI model and analyzing your image..."
+            ):
+                processor, model = load_vqa_model()
+                results = answer_question(
+                    image, question, processor, model
+                )
+
+            st.markdown("### Your question")
+            st.write(question)
+
+            st.markdown("### AI answer")
+            st.success(results[0]["answer"])
+
+            st.caption(
+                "This answer is generated by a pretrained AI model "
+                "and may not describe the image correctly."
             )
 
-    if st.button("Clear History"):
-        st.session_state.history = []
-        st.rerun()
-else:
-    st.write("No questions asked in this session yet.")
+            st.markdown("### Alternative answers")
+
+            for number, result in enumerate(results, start=1):
+                st.write(
+                    f"{number}. {result['answer']} "
+                    f"(model score: {result['score']:.3f})"
+                )
+
+            st.warning(
+                "Uncertainty note: these scores are normalized model "
+                "scores, NOT calibrated probabilities of correctness. "
+                "Reliability must be evaluated separately."
+            )
+
+            st.markdown("### Listen to the answer")
+            speak_answer(
+                "The AI answer is " + results[0]["answer"]
+            )
+
+            st.session_state["last_answer"] = results[0]["answer"]
+            st.session_state["last_question"] = question
+
+        except Exception as error:
+            st.error(
+                "The AI could not process this request. "
+                "Check the app logs for the technical error."
+            )
+            with st.expander("Technical details"):
+                st.code(str(error))
+
+
+# ---------------- PROJECT INFORMATION ----------------
+
+with st.expander("About this research project"):
+    st.write("""
+    **Research focus:** Trustworthy Visual Question Answering
+    for assistive technology.
+
+    **Baseline model:** ViLT fine-tuned on VQAv2.
+
+    **Current prototype features:**
+    - Image capture and upload
+    - Typed questions
+    - Voice recording and speech recognition
+    - AI answer generation
+    - Alternative answers and model scores
+    - Browser-based speech output
+    - An explicit warning about uncertainty
+
+    **Research limitation:** Evidence grounding and calibrated
+    uncertainty estimation are not fully implemented in this
+    baseline. They require additional methods and evaluation.
+    """)
