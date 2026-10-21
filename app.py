@@ -1,171 +1,102 @@
 
-import io
-import json
-import html
 
 import streamlit as st
+import streamlit.components.v1 as components
 import torch
 import speech_recognition as sr
 
 from PIL import Image
-from transformers import ViltProcessor, ViltForQuestionAnswering
-import streamlit.components.v1 as components
+from transformers import (
+    ViltProcessor,
+    ViltForQuestionAnswering,
+    OwlViTProcessor,
+    OwlViTForObjectDetection,
+)
 
-
-# ---------------- PAGE SETTINGS ----------------
+# ---------------- SETTINGS ----------------
 
 st.set_page_config(
     page_title="Trustworthy VQA Assistant",
     page_icon="👁️",
-    layout="centered"
+    layout="centered",
 )
 
 torch.set_num_threads(2)
 
-MODEL_NAME = "dandelin/vilt-b32-finetuned-vqa"
+VQA_MODEL = "dandelin/vilt-b32-finetuned-vqa"
+DETECTOR_MODEL = "google/owlvit-base-patch32"
 
-st.markdown("""
-<style>
-    .block-container {
-        max-width: 900px;
-        padding-top: 2rem;
-        padding-bottom: 3rem;
-    }
-    .main-title {
-        font-size: 2rem;
-        font-weight: 750;
-        text-align: center;
-    }
-    .subtitle {
-        text-align: center;
-        color: #777777;
-        margin-bottom: 25px;
-    }
-</style>
-""", unsafe_allow_html=True)
+st.title("👁️ Trustworthy VQA Assistant")
+st.write(
+    "Ask questions about images and detect everyday objects."
+)
+
+st.info(
+    "This is a research prototype. AI answers and detections "
+    "may be incorrect. Do not rely on them for safety-critical decisions."
+)
 
 
-# ---------------- MODEL LOADING ----------------
+# ---------------- RESET ----------------
+
+if st.button("🔄 New Question / Reset", use_container_width=True):
+    for key in [
+        "question_text",
+        "voice_question",
+        "last_answer",
+        "last_question",
+        "last_objects",
+        "voice_audio",
+        "uploaded_image",
+        "camera_image",
+        "image_source",
+    ]:
+        st.session_state.pop(key, None)
+
+    st.rerun()
+
+
+# ---------------- LOAD MODELS ----------------
 
 @st.cache_resource(show_spinner=False)
-def load_vqa_model():
-    processor = ViltProcessor.from_pretrained(MODEL_NAME)
-    model = ViltForQuestionAnswering.from_pretrained(MODEL_NAME)
+def load_vqa():
+    processor = ViltProcessor.from_pretrained(VQA_MODEL)
+    model = ViltForQuestionAnswering.from_pretrained(VQA_MODEL)
     model.eval()
     return processor, model
 
 
-# ---------------- VOICE OUTPUT ----------------
-
-def speak_answer(text):
-    safe_text = json.dumps(text)
-    components.html(
-        f"""
-        <button onclick='
-            window.speechSynthesis.cancel();
-            var msg = new SpeechSynthesisUtterance({safe_text});
-            msg.lang = "en-IN";
-            window.speechSynthesis.speak(msg);
-        ' style="
-            padding:12px 20px;
-            border-radius:10px;
-            border:0;
-            background:#1769aa;
-            color:white;
-            font-size:16px;
-            cursor:pointer;">
-            🔊 Speak Answer
-        </button>
-        """,
-        height=65
-    )
+@st.cache_resource(show_spinner=False)
+def load_detector():
+    processor = OwlViTProcessor.from_pretrained(DETECTOR_MODEL)
+    model = OwlViTForObjectDetection.from_pretrained(DETECTOR_MODEL)
+    model.eval()
+    return processor, model
 
 
-# ---------------- VOICE QUESTION INPUT ----------------
+# ---------------- IMAGE INPUT ----------------
 
-def transcribe_audio(audio_file):
-    recognizer = sr.Recognizer()
+st.header("1. Choose an image")
 
-    with sr.AudioFile(io.BytesIO(audio_file.getvalue())) as source:
-        audio_data = recognizer.record(source)
-
-    return recognizer.recognize_google(
-        audio_data,
-        language="en-IN"
-    )
-
-
-# ---------------- AI ANSWERING ----------------
-
-def answer_question(image, question, processor, model):
-    inputs = processor(
-        images=image,
-        text=question,
-        return_tensors="pt"
-    )
-
-    with torch.inference_mode():
-        outputs = model(**inputs)
-        probabilities = torch.softmax(
-            outputs.logits[0], dim=-1
-        )
-
-    count = min(3, probabilities.numel())
-    scores, indices = torch.topk(probabilities, k=count)
-
-    results = []
-
-    for score, index in zip(scores.tolist(), indices.tolist()):
-        label = model.config.id2label.get(
-            index, str(index)
-        )
-        results.append({
-            "answer": str(label),
-            "score": float(score)
-        })
-
-    return results
-
-
-# ---------------- MAIN INTERFACE ----------------
-
-st.markdown(
-    '<div class="main-title">👁️ Trustworthy VQA Assistant</div>',
-    unsafe_allow_html=True
-)
-
-st.markdown(
-    '<div class="subtitle">'
-    'Ask questions about an image using text or voice.'
-    '</div>',
-    unsafe_allow_html=True
-)
-
-st.info(
-    "Assistive technology demo: AI answers may be incorrect. "
-    "Do not rely on this prototype alone for navigation, "
-    "emergency decisions, or other safety-critical tasks."
-)
-
-st.subheader("1. Capture or upload an image")
-
-input_method = st.radio(
-    "Choose image input",
-    ["Use Camera", "Upload Image"],
-    horizontal=True
+image_source = st.radio(
+    "Image input",
+    ["Camera", "Upload"],
+    horizontal=True,
+    key="image_source",
 )
 
 image_file = None
 
-if input_method == "Use Camera":
+if image_source == "Camera":
     image_file = st.camera_input(
         "Take a picture",
-        key="camera"
+        key="camera_image",
     )
 else:
     image_file = st.file_uploader(
-        "Choose an image",
-        type=["jpg", "jpeg", "png", "webp"]
+        "Upload a photo",
+        type=["jpg", "jpeg", "png", "webp"],
+        key="uploaded_image",
     )
 
 image = None
@@ -175,139 +106,255 @@ if image_file is not None:
         image = Image.open(image_file).convert("RGB")
         st.image(
             image,
-            caption="Image for AI analysis",
-            use_container_width=True
+            caption="Selected image",
+            use_container_width=True,
         )
     except Exception:
-        st.error("The image could not be opened. Try another image.")
+        st.error("Could not read this image. Please try another.")
         image = None
 
 
-st.subheader("2. Ask a question")
+# ---------------- QUESTION INPUT ----------------
+
+st.header("2. Ask your question")
 
 question_text = st.text_input(
-    "Type your question",
-    placeholder="Example: What is in front of me?",
-    key="typed_question"
+    "Type a question",
+    placeholder="Example: What is in this picture?",
+    key="question_text",
 )
-
-st.caption("Or record your question in English.")
 
 audio_file = st.audio_input(
-    "🎙️ Record a question",
-    sample_rate=16000
+    "🎙️ Record your question",
+    key="voice_audio",
 )
 
-if audio_file is not None:
-    if st.button("Convert voice to text"):
-        with st.spinner("Recognizing your speech..."):
-            try:
-                recognized_text = transcribe_audio(audio_file)
-                st.session_state["voice_question"] = recognized_text
-                st.success("Recognized question:")
-                st.write(recognized_text)
-            except sr.UnknownValueError:
-                st.error("Speech was unclear. Please record again.")
-            except sr.RequestError:
-                st.error(
-                    "Speech recognition service is unavailable. "
-                    "Check your internet connection and try again."
-                )
-            except Exception as error:
-                st.error(f"Audio processing failed: {error}")
+if st.button("Convert voice to text"):
+    if audio_file is None:
+        st.warning("Record a question first.")
+    else:
+        try:
+            recognizer = sr.Recognizer()
 
+            with sr.AudioFile(audio_file) as source:
+                audio_data = recognizer.record(source)
+
+            with st.spinner("Recognizing speech..."):
+                recognized = recognizer.recognize_google(
+                    audio_data,
+                    language="en-IN",
+                )
+
+            st.session_state["voice_question"] = recognized
+            st.success("Recognized question")
+            st.write(recognized)
+
+        except sr.UnknownValueError:
+            st.error("Speech was unclear. Please record again.")
+        except sr.RequestError:
+            st.error(
+                "Speech recognition service is unavailable. "
+                "Check your internet connection."
+            )
+        except Exception as exc:
+            st.error(f"Audio error: {exc}")
 
 voice_question = st.session_state.get("voice_question", "")
 question = question_text.strip() or voice_question.strip()
 
-st.caption(
-    "Typed question takes priority. Otherwise, the converted "
-    "voice question is used."
-)
+
+# ---------------- OBJECT DETECTION ----------------
+
+def detect_objects(image):
+    processor, model = load_detector()
+
+    labels = [
+        "water bottle",
+        "bag",
+        "handbag",
+        "backpack",
+        "cup",
+        "glass",
+        "chair",
+        "table",
+        "book",
+        "mobile phone",
+        "keys",
+        "shoe",
+        "person",
+        "door",
+        "laptop",
+        "bowl",
+        "plate",
+        "umbrella",
+        "wallet",
+        "remote control",
+        "pen",
+        "watch",
+        "bottle",
+        "box",
+        "sofa",
+        "bed",
+        "fan",
+        "television",
+        "food",
+        "clothing",
+    ]
+
+    inputs = processor(
+        text=[labels],
+        images=image,
+        return_tensors="pt",
+    )
+
+    with torch.inference_mode():
+        outputs = model(**inputs)
+
+    target_sizes = torch.tensor([image.size[::-1]])
+
+    results = processor.post_process_grounded_object_detection(
+        outputs,
+        target_sizes=target_sizes,
+        threshold=0.10,
+        text_labels=[labels],
+    )[0]
+
+    objects = []
+
+    for score, label, box in zip(
+        results["scores"],
+        results["text_labels"],
+        results["boxes"],
+    ):
+        objects.append({
+            "label": str(label),
+            "score": float(score),
+            "box": [round(float(x)) for x in box.tolist()],
+        })
+
+    return objects
 
 
-st.subheader("3. Get the AI answer")
+# ---------------- VQA ANSWERING ----------------
 
-if st.button("🔍 Analyze Image and Answer", type="primary",
-             use_container_width=True):
+def answer_question(image, question):
+    processor, model = load_vqa()
 
+    inputs = processor(
+        images=image,
+        text=question,
+        return_tensors="pt",
+    )
+
+    with torch.inference_mode():
+        outputs = model(**inputs)
+        probs = torch.softmax(outputs.logits[0], dim=-1)
+
+    count = min(3, probs.numel())
+    scores, indices = torch.topk(probs, k=count)
+
+    answers = []
+
+    for score, index in zip(scores.tolist(), indices.tolist()):
+        answers.append({
+            "answer": model.config.id2label.get(index, str(index)),
+            "score": float(score),
+        })
+
+    return answers
+
+
+# ---------------- RUN ANALYSIS ----------------
+
+st.header("3. Analyze")
+
+if st.button("🔍 Analyze Image", type="primary", use_container_width=True):
     if image is None:
-        st.warning("Please capture or upload an image first.")
-
+        st.warning("Capture or upload an image first.")
     elif not question:
-        st.warning("Please type a question or convert a voice question.")
-
+        st.warning("Type a question or convert a voice recording first.")
     else:
         try:
-            with st.spinner(
-                "Loading the AI model and analyzing your image..."
-            ):
-                processor, model = load_vqa_model()
-                results = answer_question(
-                    image, question, processor, model
-                )
+            with st.spinner("Loading AI models and analyzing..."):
+                answers = answer_question(image, question)
+                objects = detect_objects(image)
 
-            st.markdown("### Your question")
-            st.write(question)
-
-            st.markdown("### AI answer")
-            st.success(results[0]["answer"])
-
-            st.caption(
-                "This answer is generated by a pretrained AI model "
-                "and may not describe the image correctly."
-            )
-
-            st.markdown("### Alternative answers")
-
-            for number, result in enumerate(results, start=1):
-                st.write(
-                    f"{number}. {result['answer']} "
-                    f"(model score: {result['score']:.3f})"
-                )
-
-            st.warning(
-                "Uncertainty note: these scores are normalized model "
-                "scores, NOT calibrated probabilities of correctness. "
-                "Reliability must be evaluated separately."
-            )
-
-            st.markdown("### Listen to the answer")
-            speak_answer(
-                "The AI answer is " + results[0]["answer"]
-            )
-
-            st.session_state["last_answer"] = results[0]["answer"]
+            st.session_state["last_answer"] = answers[0]["answer"]
             st.session_state["last_question"] = question
+            st.session_state["last_objects"] = objects
 
-        except Exception as error:
+        except Exception as exc:
             st.error(
-                "The AI could not process this request. "
-                "Check the app logs for the technical error."
+                "Analysis failed. Check the app logs for details."
             )
-            with st.expander("Technical details"):
-                st.code(str(error))
+            st.code(str(exc))
 
+if "last_answer" in st.session_state:
+    st.subheader("AI Answer")
+    st.success(st.session_state["last_answer"])
 
-# ---------------- PROJECT INFORMATION ----------------
+    st.write("**Question:**", st.session_state["last_question"])
 
-with st.expander("About this research project"):
-    st.write("""
-    **Research focus:** Trustworthy Visual Question Answering
-    for assistive technology.
+    st.caption(
+        "Model scores are not calibrated probabilities of correctness."
+    )
 
-    **Baseline model:** ViLT fine-tuned on VQAv2.
+    st.subheader("Alternative answers")
 
-    **Current prototype features:**
-    - Image capture and upload
-    - Typed questions
-    - Voice recording and speech recognition
-    - AI answer generation
-    - Alternative answers and model scores
-    - Browser-based speech output
-    - An explicit warning about uncertainty
+    for item in answers if "answers" in locals() else []:
+        st.write(
+            f"{item['answer']} — model score {item['score']:.3f}"
+        )
 
-    **Research limitation:** Evidence grounding and calibrated
-    uncertainty estimation are not fully implemented in this
-    baseline. They require additional methods and evaluation.
-    """)
+    answer_text = st.session_state["last_answer"]
+
+    st.subheader("Listen to the answer")
+    components.html(
+        f"""
+        <button id="speakBtn" style="
+            padding:12px 18px;
+            border:0;
+            border-radius:9px;
+            background:#1769aa;
+            color:white;
+            font-size:16px;">
+            🔊 Speak Answer
+        </button>
+        <script>
+        document.getElementById("speakBtn").onclick = function() {{
+            window.speechSynthesis.cancel();
+            const message = new SpeechSynthesisUtterance(
+                {__import__('json').dumps(answer_text)}
+            );
+            message.lang = "en-IN";
+            window.speechSynthesis.speak(message);
+        }};
+        </script>
+        """,
+        height=65,
+    )
+
+    st.subheader("Detected everyday objects")
+
+    objects = st.session_state.get("last_objects", [])
+
+    if objects:
+        seen = set()
+        for obj in objects:
+            label = obj["label"]
+            if label not in seen:
+                st.write(
+                    f"• {label} "
+                    f"(detection score: {obj['score']:.2f})"
+                )
+                seen.add(label)
+    else:
+        st.write(
+            "No objects were detected from the selected label list. "
+            "This does not prove the image contains no objects."
+        )
+
+    st.warning(
+        "Check important answers visually. Object detection can miss "
+        "items or incorrectly label similar objects."
+    )
